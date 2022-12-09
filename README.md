@@ -4,5 +4,6 @@
 2. [Positional Embedding](https://github.com/sjchoi86/yet-another-diffusion-models/blob/main/code/demo_position_embedding.ipynb)
 3. [Forward diffusion process](https://github.com/sjchoi86/yet-another-diffusion-models/blob/main/code/demo_forward_diffusion.ipynb)
 4. [Reverse diffusion process](https://github.com/sjchoi86/yet-another-diffusion-models/blob/main/code/demo_reverse_diffusion.ipynb)
+4. [Reverse diffusion with RKHS projection](https://github.com/sjchoi86/yet-another-diffusion-models/blob/main/code/demo_reverse_diffusion_rkhs_proj.ipynb)
 
 Contact: sungjoon-choi@korea.ac.kr
