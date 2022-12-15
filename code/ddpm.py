@@ -49,7 +49,7 @@ def plot_ddpm_constants(dc,figsize=(12,4)):
 
 # Forward Hilbert diffusion sampler
 def forward_hilbert_diffusion_sample(x_0,K_chols,steps,dc,noise_rate=1.0,RKHS_projs=None,
-                                     noise_type='Gaussian'):
+                                     noise_type='Gaussian',device='cpu'):
     """
         x_0: torch.Tensor [B x D x L]
         K_chols: torch.Tensor [D x L x L]
@@ -91,7 +91,8 @@ def forward_hilbert_diffusion_sample(x_0,K_chols,steps,dc,noise_rate=1.0,RKHS_pr
     return x_t,correlated_noise # [B x D x L]
     
 # DDPM loss
-def get_ddpm_loss(model,x_0,K_chols,t,dc,noise_rate=1.0,RKHS_projs=None,noise_type='Gaussian'):
+def get_ddpm_loss(model,x_0,K_chols,t,dc,noise_rate=1.0,RKHS_projs=None,noise_type='Gaussian',
+                  l1_w=0.0,l2_w=1.0,huber_w=0.0,smt_l1_w=0.0):
     """
         x_0: [B x D x L]
         K_chols: [D x L x L]
@@ -106,11 +107,11 @@ def get_ddpm_loss(model,x_0,K_chols,t,dc,noise_rate=1.0,RKHS_projs=None,noise_ty
     noise_pred = model(x_noisy_flat, t) # [B x DL]
     # Compute loss
     noise_pred_unflat = noise_pred.reshape_as(x_0) # [B x D x L]
-    l1_loss = F.l1_loss(noise,noise_pred_unflat)
-    l2_loss = F.mse_loss(noise,noise_pred_unflat)
-    huber_loss = F.huber_loss(noise,noise_pred_unflat)
-    sl1_loss = F.smooth_l1_loss(noise,noise_pred_unflat,beta=0.1)
-    loss = (l1_loss+l2_loss+huber_loss+sl1_loss)/4.0
+    l1_loss     = F.l1_loss(noise,noise_pred_unflat)
+    l2_loss     = F.mse_loss(noise,noise_pred_unflat)
+    huber_loss  = F.huber_loss(noise,noise_pred_unflat)
+    smt_l1_loss = F.smooth_l1_loss(noise,noise_pred_unflat,beta=0.1)
+    loss = l1_w*l1_loss+l2_w*l2_loss+huber_w*huber_loss+smt_l1_w*smt_l1_loss
     return loss    
 
 def eval_hddpm_1D(
@@ -124,8 +125,8 @@ def eval_hddpm_1D(
     D = K_chols.shape[0]
     L = times.shape[0]
     # Sample x_T from prior
-    x_0_dummy = np2torch(np.zeros((B,D,L)))
-    steps = torch.zeros(B).type(torch.long) # [B]
+    x_0_dummy = np2torch(np.zeros((B,D,L)),device=device)
+    steps = torch.zeros(B).type(torch.long).to(device) # [B]
     _,correlated_noise = forward_hilbert_diffusion_sample(
         x_0=x_0_dummy,K_chols=K_chols,steps=steps,dc=dc,noise_rate=1.0,
         RKHS_projs=RKHS_projs,noise_type='Gaussian')
@@ -158,7 +159,7 @@ def eval_hddpm_1D(
             x_t - betas_t*eps_t_unflat/sqrt_one_minus_alphas_bar_t
         ) # [B x D x L]
         # Compute correlated noise
-        x_0_dummy = np2torch(np.zeros((B,D,L)))
+        x_0_dummy = np2torch(np.zeros((B,D,L)),device=device)
         steps = torch.zeros(B).type(torch.long) # [B]
         _,noise_t = forward_hilbert_diffusion_sample(
             x_0=x_0_dummy,K_chols=K_chols,steps=steps,dc=dc,noise_rate=1.0,
@@ -179,13 +180,15 @@ def eval_hddpm_1D(
     # Plot generated trajectories
     for d_idx in range(D):
         for b_idx in range(B):
-            plt.figure(figsize=(12,1))
+            plt.figure(figsize=(6,1))
             plt.subplot(1,2,1)
-            plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b'); plt.grid('on')
+            if x_0 is not None:
+                plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b'); plt.grid('on')
             plt.title('batch:[%d/%d] dim:[%d] Data'%(b_idx,B,d_idx),fontsize=8); 
             plt.xlim(0,+1); plt.ylim(-2.5,+2.5)
             plt.subplot(1,2,2)
-            plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1/2); 
+            if x_0 is not None:
+                plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1/2); 
             plt.plot(times[:,0],torch2np(x_t)[b_idx,d_idx,:],ls='-',color='k'); plt.grid('on')
             plt.title('dim:[%d]'%(d_idx),fontsize=8); 
             plt.xlim(0,+1); plt.ylim(-2.5,+2.5)
@@ -197,7 +200,8 @@ def eval_hddpm_1D(
             plt.figure(figsize=(12,1))
             for subplot_idx,t in enumerate(np.linspace(0,dc['T']-1,M).astype(np.int64)):
                 plt.subplot(1,M,subplot_idx+1)
-                plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1) # GT 
+                if x_0 is not None:
+                    plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1) # GT 
                 plt.plot(times[:,0],torch2np(x_ts[t][b_idx,d_idx,:]),ls='-',color='k',lw=1) # generated
                 plt.xlim(0,+1); plt.ylim(-2.5,+2.5); plt.grid('on')
                 plt.title('dim:[%d] t:[%d]'%(d_idx,t),fontsize=8)
