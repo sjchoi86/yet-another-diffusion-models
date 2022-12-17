@@ -27,6 +27,7 @@ def plot_ddpm_constants(dc,figsize=(12,4)):
     cs = [plt.cm.gist_rainbow(x) for x in np.linspace(0,1,8)]
     lw = 2 # linewidth
     plt.figure(figsize=figsize)
+
     plt.subplot(1,2,1)
     plt.plot(ts,torch2np(dc['betas']),color=cs[0],label=r'$\beta_t$',lw=lw)
     plt.plot(ts,torch2np(dc['alphas']),color=cs[1],label=r'$\alpha_t$',lw=lw)
@@ -35,13 +36,22 @@ def plot_ddpm_constants(dc,figsize=(12,4)):
     plt.plot(ts,torch2np(dc['sqrt_recip_alphas']),color=cs[4],label=r'$\frac{1}{\sqrt{\alpha_t}}$',lw=lw)
     plt.plot(ts,torch2np(dc['sqrt_alphas_bar']),color=cs[5],label=r'$\sqrt{\bar{\alpha}_t}$',lw=lw)
     plt.plot(ts,torch2np(dc['sqrt_one_minus_alphas_bar']),color=cs[6],label=r'$\sqrt{1-\bar{\alpha}_t}$',lw=lw)
+
+    plt.plot(ts,torch2np(dc['betas'])/torch2np(dc['sqrt_one_minus_alphas_bar']),
+        color=cs[7],label=r'$\frac{1-\alpha_t}{ \sqrt{ 1-\bar{\alpha}_t } }$',lw=lw)
+
     plt.plot(ts,torch2np(dc['posterior_variance']),'--',color='k',label=r'$ Var[x_{t-1}|x_t,x_0] $',lw=lw)
     plt.xlabel('Diffusion steps',fontsize=8)
     plt.legend(fontsize=10,loc='center left',bbox_to_anchor=(1,0.5))
-    plt.title('DDPM Constants',fontsize=10); plt.grid(lw=0.5);
+    plt.title('DDPM Constants',fontsize=10); plt.grid(lw=0.5)
+
     plt.subplot(1,2,2)
     plt.plot(ts,torch2np(dc['betas']),color=cs[0],label=r'$\beta_t$',lw=lw)
     plt.plot(ts,torch2np(dc['posterior_variance']),'--',color='k',label=r'$ Var[x_{t-1}|x_t,x_0] $',lw=lw)
+
+    plt.plot(ts,torch2np(dc['betas'])/torch2np(dc['sqrt_one_minus_alphas_bar']),
+        color=cs[7],label=r'$\frac{1-\alpha_t}{ \sqrt{ 1-\bar{\alpha}_t } }$',lw=lw)
+        
     plt.xlabel('Diffusion steps',fontsize=8)
     plt.legend(fontsize=10,loc='center left',bbox_to_anchor=(1,0.5))
     plt.title('DDPM Constants',fontsize=10); plt.grid(lw=0.5); 
@@ -91,33 +101,69 @@ def forward_hilbert_diffusion_sample(x_0,K_chols,steps,dc,noise_rate=1.0,RKHS_pr
     return x_t,correlated_noise # [B x D x L]
     
 # DDPM loss
-def get_ddpm_loss(model,x_0,K_chols,t,dc,noise_rate=1.0,RKHS_projs=None,noise_type='Gaussian',
-                  l1_w=0.0,l2_w=1.0,huber_w=0.0,smt_l1_w=0.0):
+def get_ddpm_loss(model,x_batch,K_chols,A=None,V=None,
+                  t=0,dc={},noise_rate=1.0,RKHS_projs=None,noise_type='Gaussian',
+                  l1_w=0.0,l2_w=1.0,huber_w=0.0,smt_l1_w=0.0,
+                  vel_w=1e-6,acc_w=1e-6):
     """
-        x_0: [B x D x L]
+        x_batch: [B x D x L]
         K_chols: [D x L x L]
+        A: [L x L]
+        V: [L x L]
     """
     # Sample from forward diffusion
     x_noisy,noise = forward_hilbert_diffusion_sample(
-        x_0=x_0,K_chols=K_chols,steps=t,dc=dc,noise_rate=noise_rate,
+        x_0=x_batch,K_chols=K_chols,steps=t,dc=dc,noise_rate=noise_rate,
         RKHS_projs=RKHS_projs,noise_type=noise_type
     ) # [B x D x L]
+
     # Predict noise
     x_noisy_flat = x_noisy.reshape(x_noisy.shape[0],-1) # [B x DL]
     noise_pred = model(x_noisy_flat, t) # [B x DL]
-    # Compute loss
-    noise_pred_unflat = noise_pred.reshape_as(x_0) # [B x D x L]
-    l1_loss     = F.l1_loss(noise,noise_pred_unflat)
-    l2_loss     = F.mse_loss(noise,noise_pred_unflat)
-    huber_loss  = F.huber_loss(noise,noise_pred_unflat)
-    smt_l1_loss = F.smooth_l1_loss(noise,noise_pred_unflat,beta=0.1)
-    loss = l1_w*l1_loss+l2_w*l2_loss+huber_w*huber_loss+smt_l1_w*smt_l1_loss
-    return loss    
+    noise_pred_unflat = noise_pred.reshape_as(x_batch) # [B x D x L]
+    x_t_minus_one = x_batch - 0.01*noise_pred_unflat # [B x D x L]
+    
+    # Smoothing loss
+    if V is not None:
+        V_expand = V[None,None,:,:] # [1 x 1 x L x L]
+        V_expand_tile = torch.tile(input=V_expand,dims=(x_t_minus_one.shape[0],x_t_minus_one.shape[1],1,1)) # [B x D x L x L]
+        x_t_minus_one_expand = x_t_minus_one[:,:,:,None] # [B x D x L x 1]
+        vel = V_expand_tile @ x_t_minus_one_expand # [B x D x L x 1]
+        vel = vel.squeeze(dim=3) # [B x D x L]
+        vel_squared = torch.square(vel) # [B x D x L]
+        vel_loss = torch.mean(vel_squared) # [1]: average acceleration error
+    else:
+        vel_loss = 0.0
+    if A is not None:
+        A_expand = A[None,None,:,:] # [1 x 1 x L x L]
+        A_expand_tile = torch.tile(input=A_expand,dims=(x_t_minus_one.shape[0],x_t_minus_one.shape[1],1,1)) # [B x D x L x L]
+        x_t_minus_one_expand = x_t_minus_one[:,:,:,None] # [B x D x L x 1]
+        acc = A_expand_tile @ x_t_minus_one_expand # [B x D x L x 1]
+        acc = acc.squeeze(dim=3) # [B x D x L]
+        acc_squared = torch.square(acc) # [B x D x L]
+        acc_loss = torch.mean(acc_squared) # [1]: average acceleration error
+    else:
+        acc_loss = 0.0
 
+    # Compute prediction loss
+    l1_loss     = F.l1_loss(noise,noise_pred_unflat) # [1]
+    l2_loss     = F.mse_loss(noise,noise_pred_unflat) # [1]
+    huber_loss  = F.huber_loss(noise,noise_pred_unflat) # [1]
+    smt_l1_loss = F.smooth_l1_loss(noise,noise_pred_unflat,beta=0.1) # [1]
+    loss = l1_w*l1_loss+l2_w*l2_loss+huber_w*huber_loss+smt_l1_w*smt_l1_loss+ \
+            vel_w*vel_loss+acc_w*acc_loss # [1]
+    info = {'l1':l1_w*l1_loss,'l2':l2_w*l2_loss,'huber':huber_w*huber_loss,'smt_l1':smt_l1_w*smt_l1_loss,
+            'vel':vel_w*vel_loss,'acc':acc_w*acc_loss}
+
+    return loss,info
+
+# Evaluate
 def eval_hddpm_1D(
     model,dc,K_chols,RKHS_projs,times,x_0,
     B=3,M=8,device='cpu',
-    RKHS_PROJECTION_EACH_X_T=False):
+    RKHS_PROJECTION_EACH_X_T=False,
+    PLOT_GENERATED_TRAJECTORIES_AT_ONCE=True,
+    PLOT_ANCESTRAL_STEPS=True):
     """
         Evaluate Hilbert-space DDPM for 1D
     """
@@ -178,34 +224,68 @@ def eval_hddpm_1D(
         x_ts[t] = x_t # [B x D x L]
     
     # Plot generated trajectories
-    for d_idx in range(D):
-        for b_idx in range(B):
-            plt.figure(figsize=(6,1))
-            plt.subplot(1,2,1)
-            if x_0 is not None:
-                plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b'); plt.grid('on')
-            plt.title('batch:[%d/%d] dim:[%d] Data'%(b_idx,B,d_idx),fontsize=8); 
-            plt.xlim(0,+1); plt.ylim(-2.5,+2.5)
-            plt.subplot(1,2,2)
-            if x_0 is not None:
-                plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1/2); 
-            plt.plot(times[:,0],torch2np(x_t)[b_idx,d_idx,:],ls='-',color='k'); plt.grid('on')
-            plt.title('dim:[%d]'%(d_idx),fontsize=8); 
+    if PLOT_GENERATED_TRAJECTORIES_AT_ONCE:
+        for d_idx in range(D):
+            plt.figure(figsize=(6,2))
+            for b_idx in range(B):
+                # Plot sampled trajectoires
+                for b_idx in range(B):
+                    plt.plot(times[:,0],torch2np(x_t)[b_idx,d_idx,:],ls='-',color='k')
+                # Plot training data
+                if len(x_0.shape) == 2: # [D x L]
+                    plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1/4); 
+                elif len(x_0.shape) == 3: # [M x D x L]
+                    M = x_0.shape[0]
+                    for m_idx in range(M):
+                        plt.plot(times[:,0],torch2np(x_0)[m_idx,d_idx,:],ls='-',color='b',lw=1/4)
+            plt.grid('on')
+            plt.title('Generated Samples (D:[%d])'%(d_idx),fontsize=8); 
             plt.xlim(0,+1); plt.ylim(-2.5,+2.5)
             plt.show()
+    else:
+        for d_idx in range(D):
+            for b_idx in range(B):
+                plt.figure(figsize=(6,1))
+                plt.subplot(1,2,1)
+                if len(x_0.shape) == 2:
+                    plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b');
+                elif len(x_0.shape) == 3: # [M x D x L]
+                    M = x_0.shape[0]
+                    for m_idx in range(M):
+                        plt.plot(times[:,0],torch2np(x_0)[m_idx,d_idx,:],ls='-',color='b',lw=1/2); 
+                plt.grid('on')
+                plt.title('batch:[%d/%d] dim:[%d] Data'%(b_idx,B,d_idx),fontsize=8); 
+                plt.xlim(0,+1); plt.ylim(-2.5,+2.5)
+                plt.subplot(1,2,2)
+                if len(x_0.shape) == 2:
+                    plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1/2); 
+                elif len(x_0.shape) == 3: # [M x D x L]
+                    M = x_0.shape[0]
+                    for m_idx in range(M):
+                        plt.plot(times[:,0],torch2np(x_0)[m_idx,d_idx,:],ls='-',color='b',lw=1/4); 
+                plt.plot(times[:,0],torch2np(x_t)[b_idx,d_idx,:],ls='-',color='k'); plt.grid('on')
+                plt.title('dim:[%d]'%(d_idx),fontsize=8); 
+                plt.xlim(0,+1); plt.ylim(-2.5,+2.5)
+                plt.show()
+    
             
     # Plot how the trajectories are generated
-    for d_idx in range(D):
-        for b_idx in range(B):
-            plt.figure(figsize=(12,1))
-            for subplot_idx,t in enumerate(np.linspace(0,dc['T']-1,M).astype(np.int64)):
-                plt.subplot(1,M,subplot_idx+1)
-                if x_0 is not None:
-                    plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1) # GT 
-                plt.plot(times[:,0],torch2np(x_ts[t][b_idx,d_idx,:]),ls='-',color='k',lw=1) # generated
-                plt.xlim(0,+1); plt.ylim(-2.5,+2.5); plt.grid('on')
-                plt.title('dim:[%d] t:[%d]'%(d_idx,t),fontsize=8)
-            plt.show()    
+    if PLOT_ANCESTRAL_STEPS:
+        for d_idx in range(D):
+            for b_idx in range(B):
+                plt.figure(figsize=(12,1))
+                for subplot_idx,t in enumerate(np.linspace(0,dc['T']-1,M).astype(np.int64)):
+                    plt.subplot(1,M,subplot_idx+1)
+                    if len(x_0.shape) == 2:
+                        plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1) # GT 
+                    elif len(x_0.shape) == 3: # [M x D x L]
+                        M = x_0.shape[0]
+                        for m_idx in range(M):
+                            plt.plot(times[:,0],torch2np(x_0)[m_idx,d_idx,:],ls='-',color='b',lw=1/2); 
+                    plt.plot(times[:,0],torch2np(x_ts[t][b_idx,d_idx,:]),ls='-',color='k',lw=1) # generated
+                    plt.xlim(0,+1); plt.ylim(-2.5,+2.5); plt.grid('on')
+                    plt.title('dim:[%d] t:[%d]'%(d_idx,t),fontsize=8)
+                plt.show()    
 
     # Back to train mode
     model.train()
