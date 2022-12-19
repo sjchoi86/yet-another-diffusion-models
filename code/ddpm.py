@@ -1,8 +1,10 @@
 import torch
+from torch import nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from util import np2torch,torch2np,gather_and_reshape
+from util import np2torch,torch2np,gather_and_reshape,kernel_se,get_rkhs_proj
+from model import DenoisingDenseUNetClass
 
 # DDPM constants
 def get_ddpm_constants(beta_start=1e-4,beta_end=0.02,diffusion_step=1000):
@@ -121,7 +123,7 @@ def get_ddpm_loss(model,x_batch,K_chols,A=None,V=None,
     x_noisy_flat = x_noisy.reshape(x_noisy.shape[0],-1) # [B x DL]
     noise_pred = model(x_noisy_flat, t) # [B x DL]
     noise_pred_unflat = noise_pred.reshape_as(x_batch) # [B x D x L]
-    x_t_minus_one = x_batch - 0.01*noise_pred_unflat # [B x D x L]
+    x_t_minus_one = x_batch - 0.1*noise_pred_unflat # [B x D x L]
     
     # Smoothing loss
     if V is not None:
@@ -226,11 +228,24 @@ def eval_hddpm_1D(
     # Plot generated trajectories
     if PLOT_GENERATED_TRAJECTORIES_AT_ONCE:
         for d_idx in range(D):
-            plt.figure(figsize=(6,2))
+            plt.figure(figsize=(12,2))
+            plt.subplot(1,2,1)
+            for b_idx in range(B):
+                # Plot training data
+                if len(x_0.shape) == 2: # [D x L]
+                    plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1/4); 
+                elif len(x_0.shape) == 3: # [M x D x L]
+                    M = x_0.shape[0]
+                    for m_idx in range(M):
+                        plt.plot(times[:,0],torch2np(x_0)[m_idx,d_idx,:],ls='-',color='b',lw=1/4)
+            plt.grid('on')
+            plt.title('Training Data (D:[%d])'%(d_idx),fontsize=8); 
+            plt.xlim(0,+1); plt.ylim(-2.5,+2.5)
+            plt.subplot(1,2,2)
             for b_idx in range(B):
                 # Plot sampled trajectoires
                 for b_idx in range(B):
-                    plt.plot(times[:,0],torch2np(x_t)[b_idx,d_idx,:],ls='-',color='k')
+                    plt.plot(times[:,0],torch2np(x_t)[b_idx,d_idx,:],ls='-',color='k',lw=1)
                 # Plot training data
                 if len(x_0.shape) == 2: # [D x L]
                     plt.plot(times[:,0],torch2np(x_0)[d_idx,:],ls='-',color='b',lw=1/4); 
@@ -289,3 +304,88 @@ def eval_hddpm_1D(
 
     # Back to train mode
     model.train()
+
+def ddpm_train_wrapper(
+    times,x_0,dc,
+    actv=nn.ReLU(),
+    hyp_len_forward=0.1,
+    hyp_len_projection=0.1,
+    hyp_sig2w=1e-6,
+    n_sample=20,
+    base_lr=1e-3,MAX_ITER=1e5,BATCH_SIZE=128,
+    l1_w=1.0,l2_w=10.0,huber_w=0.0,smt_l1_w=0.0,
+    A=None,V=None,vel_w=0.0,acc_w=0.0,
+    RKHS_PROJECTION_EACH_X_T=False,
+    device='cpu'
+    ):
+    # Some infos (x_0 is either [D x L] or [M x D x L] )
+    L = times.shape[0]
+    if len(x_0.shape) == 2:
+        D = x_0.shape[0]
+    elif len(x_0.shape) == 3:
+        M = x_0.shape[0]
+        D = x_0.shape[1]
+
+    # Set Hilbert forward process
+    hyp_lens = [hyp_len_forward]*D # length parameter per each dimension
+    K_chols_np = np.zeros(shape=(D,L,L)) # [D x L x L]
+    for d_idx in range(D):
+        hyp_len = hyp_lens[d_idx]
+        if hyp_len == 0:
+            K = np.eye(L,L) # [L x L]
+        else:
+            K = kernel_se(times,times,hyp={'gain':1.0,'len':hyp_len}) # [L x L]
+        K_chols_np[d_idx,:,:] = np.linalg.cholesky(K+hyp_sig2w*np.eye(L,L)) # [L x L]
+    K_chols = np2torch(K_chols_np,device=device) # [D x L x L]
+    # Set RHKS projections
+    hyp_lens = [hyp_len_projection]*D # length parameter per each dimension
+    RKHS_projs_np = np.zeros(shape=(D,L,L)) # [D x L x L]
+    for d_idx in range(D):
+        hyp_len = hyp_lens[d_idx]
+        if hyp_len == 0:
+            RKHS_projs_np[d_idx,:,:] = np.eye(L,L) # [L x L]
+        else:
+            RKHS_projs_np[d_idx,:,:] = get_rkhs_proj(times=times,hyp_len=hyp_len,meas_std=hyp_sig2w) # [L x L]
+    RKHS_projs = np2torch(RKHS_projs_np,device=device) # [D x L x L]
+    # Model
+    model = DenoisingDenseUNetClass(
+        D=D,L=L,pos_emb_dim=32,h_dims=[128,64,32],z_dim=32,
+        actv=actv,USE_POS_EMB=True,RKHS_projs=RKHS_projs)
+    model.to(device)
+    # Train
+    model.train()
+    optm = torch.optim.Adam(
+        model.parameters(),lr=base_lr,betas=(0.9, 0.95),eps=1e-04,weight_decay=1e-08)
+    lr_schd = torch.optim.lr_scheduler.StepLR(optm,step_size=int(0.4*MAX_ITER),gamma=0.5)
+    for it in range(MAX_ITER):
+        optm.zero_grad()
+        t = torch.randint(0, dc['T'],(BATCH_SIZE,),device=device).long() # [B]
+        if len(x_0.shape) == 2:
+            x_batch = torch.tile(x_0[None,:,:],dims=(BATCH_SIZE,1,1)) # [B x D x L]
+            loss,info = get_ddpm_loss(
+                model=model,x_batch=x_batch,K_chols=K_chols,A=A,V=V,
+                t=t,dc=dc,noise_rate=1.0,
+                RKHS_projs=RKHS_projs,noise_type='Gaussian',
+                l1_w=l1_w,l2_w=l2_w,huber_w=huber_w,smt_l1_w=smt_l1_w,vel_w=vel_w,acc_w=acc_w)
+        else:
+            idx = np.random.choice(x_0.shape[0],BATCH_SIZE)
+            x_batch = x_0[idx,:,:] # [B x D x L]
+            loss,loss_info = get_ddpm_loss(
+                model=model,x_batch=x_batch,K_chols=K_chols,A=A,V=V,
+                t=t,dc=dc,noise_rate=1.0,
+                RKHS_projs=RKHS_projs,noise_type='Gaussian',
+                l1_w=l1_w,l2_w=l2_w,huber_w=huber_w,smt_l1_w=smt_l1_w,vel_w=vel_w,acc_w=acc_w)
+        loss.backward(); optm.step(); lr_schd.step()
+        # Printout
+        N_PRINT,N_PLOT = 20,10
+        if ((it % (MAX_ITER//N_PRINT)) == 0) or (it==(MAX_ITER-1)):
+            print ("[%d/%d][%.2f%%] loss:[%.3f]"%(it,MAX_ITER,100*it/MAX_ITER,loss.item()))
+            for key in loss_info.keys():
+                print ("  [%s]:[%.3f]"%(key,loss_info[key].item()))
+        # Plot evaluation results
+        if ((it % (MAX_ITER//N_PLOT)) == 0) or (it==(MAX_ITER-1)):
+            eval_hddpm_1D(
+                model,dc,K_chols,RKHS_projs,times,x_0,
+                B=n_sample,M=8,device=device,
+                RKHS_PROJECTION_EACH_X_T=RKHS_PROJECTION_EACH_X_T,
+                PLOT_ANCESTRAL_STEPS=False)    
